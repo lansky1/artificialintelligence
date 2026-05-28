@@ -540,6 +540,28 @@ When the model gets big enough, it has enough parameters to build these layered 
 
 It's like ice freezing. You cool water gradually: 10°C, 5°C, 2°C, 1°C — still liquid. Then at 0°C, it suddenly becomes ice. The temperature was dropping smoothly, but the *state change* is abrupt. There's a threshold below which the structure can't form, and above which it suddenly can. Same principle with model capabilities.
 
+**"But can't a small model reason in the token stream like a reasoning model does?"**
+
+Good question — since reasoning models offload computation into generated tokens (as described above), shouldn't a small model be able to do the same? Write out step 1, then use that as context for step 2, effectively giving itself an external scratchpad?
+
+It helps, but it doesn't fully close the gap. Here's why:
+
+**Each individual step still requires a forward pass through the model.** Chain-of-thought lets you decompose a 5-step problem into 5 separate easier predictions. But each of those predictions still has to happen in *one* forward pass through the network. If a single step requires combining 3 concepts simultaneously — understanding what operation to apply, recognising the relevant pattern, and executing correctly — the model still needs enough internal capacity to do *that* in one shot.
+
+The desk analogy extends: chain-of-thought is like giving the person a notepad. They can write down intermediate results and refer back to them. That genuinely helps — now they don't need to hold everything in their head at once. But each time they look at their notepad and think about the next step, they still only have their tiny desk to work on. If a single step requires combining 3 pieces of paper simultaneously, the desk is still too small for that one step.
+
+**Concretely, what goes wrong with small models doing chain-of-thought:**
+
+1. **Error compounding** — Each step has a higher error rate because the model's per-step reasoning is weaker. Over a 5-step chain, even a 90% per-step accuracy gives you only 59% end-to-end accuracy. A large model at 99% per-step gives 95%. The chain amplifies the weakness.
+
+2. **Inability to self-correct** — Reasoning models don't just write steps linearly. They evaluate their own reasoning, catch mistakes, backtrack. This *meta-reasoning* (reasoning about your own reasoning) is itself a complex capability that requires the same layered internal representations small models lack. A small model following chain-of-thought often can't tell when it's gone wrong.
+
+3. **Poor step decomposition** — Knowing *how* to break a hard problem into manageable sub-steps is itself a sophisticated skill. Small models often decompose poorly — choosing steps that are still too complex for them individually, or breaking things up in ways that lose critical information between steps.
+
+4. **Training signal quality** — Reasoning models are specifically trained with RL on reasoning traces that lead to correct answers. You can train a small model the same way, and it does improve — but its ceiling is fundamentally lower. The RL can't teach the model to execute steps that exceed its per-step capacity.
+
+**So does chain-of-thought help small models?** Yes — measurably. A 7B model with chain-of-thought outperforms the same 7B model without it. But a 7B model with chain-of-thought still significantly underperforms a 70B model with chain-of-thought. The token stream is a workaround for the capacity problem, not a solution. It extends what you can do with a small desk by adding a notepad — but it can't make the desk itself bigger.
+
 **2. It generalises to problems it has never seen, not just recalls ones it has.**
 
 There's a fundamental difference between memorising that `∫x² dx = x³/3 + C` and being able to solve a novel integral the model has never encountered in training. A pure lookup system would fail on new problems. LLMs don't — they apply the underlying mathematical structure to solve genuinely new problems. That's generalisation, which is closer to understanding than memorisation.
