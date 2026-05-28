@@ -7,12 +7,18 @@ nav:
   - MCP: mcp.md
 
 theme:
-  name: shadcn
+  name: material
+  palette:
+    scheme: default
+    primary: indigo
+    accent: indigo
+  features:
+    - navigation.instant
+    - navigation.tabs
+    - content.code.copy
 
 markdown_extensions:
   - admonition
-  - fenced_code
-  - codehilite
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.superfences
