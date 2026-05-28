@@ -1,0 +1,21 @@
+site_name: Artificial Intelligence
+site_url: https://lansky1.github.io/artificialintelligence/
+docs_dir: .
+
+nav:
+  - Home: index.md
+  - Generative AI: genai.md
+  - MCP: mcp.md
+
+theme:
+  name: shadcn
+
+markdown_extensions:
+  - admonition
+  - fenced_code
+  - codehilite
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
