@@ -27,7 +27,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install mkdocs-shadcn pymdownx
+        run: pip install mkdocs-shadcn pymdown-extensions
 
       - name: Build site
         run: mkdocs build --strict
