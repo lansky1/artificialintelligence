@@ -1,6 +1,5 @@
 site_name: Artificial Intelligence
 site_url: https://lansky1.github.io/artificialintelligence/
-docs_dir: .
 
 nav:
   - Home: index.md
