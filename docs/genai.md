@@ -266,6 +266,111 @@ This is called the **interpretability problem**. Researchers are working on it �
 
 ---
 
+### What's actually inside a transformer? (Attention, feed-forward, and why pre-2017 was different)
+
+Every modern LLM is built from a stack of identical **transformer blocks** (GPT-3 has 96 of them). Each block contains two types of layers: **attention** and **feed-forward**. They alternate, repeated dozens of times. That's the whole architecture.
+
+Before the stack of blocks runs, two preparatory steps happen at the very bottom of the model:
+
+- **Token embeddings** — each token ID is looked up in a learned table and replaced with a vector (e.g., 768 numbers). This is the token's starting representation.
+- **Positional encoding** — because the transformer processes all tokens in parallel (no inherent notion of order), a position vector is *added* to each token embedding to inject "this token is at position 5." Without this, the model would treat the sequence as a bag of words and have no idea which token came first. Modern models use learned positional embeddings or schemes like RoPE (Rotary Position Embedding).
+
+Then the embedded, position-aware tokens flow through the stack.
+
+**Attention — the layer where tokens *look at each other*.**
+
+For each token in the sequence, attention asks: "which other tokens (to my left) are relevant to me, and how much?" It then mixes information from those relevant tokens into the current token's representation.
+
+Concrete example. The sentence: `"The cat sat on the mat because it was tired."`
+
+When processing the token `"it"`, attention figures out that `"cat"` is the relevant antecedent (not `"mat"`). It pulls information from `"cat"` into the representation of `"it"`. That's how the model knows `"it"` refers to the cat.
+
+Mechanically: each token produces three vectors — a *query* (what am I looking for?), a *key* (what do I offer?), and a *value* (what information do I carry?). Every token's query is compared against every other token's key. High similarity = "this token is relevant to me." The relevant tokens' values are then weighted and summed into the current token.
+
+**Multi-head attention** means several attention operations run in parallel inside the same layer, each with its own Q/K/V weights. Each "head" tends to specialise — one might track syntactic structure, another coreference ("it" → "cat"), another long-range topical relevance. Their outputs are concatenated and combined. More heads = more types of relationships the model can track simultaneously.
+
+Attention is what lets transformers handle long-range dependencies — a token at position 1000 can directly attend to a token at position 1, in a single step.
+
+**Feed-forward — the layer where each token *thinks alone*.**
+
+After attention mixes information between tokens, the feed-forward layer processes each token independently. It's a simple 2-layer neural network applied to each token's vector. Its job is to transform/refine the information that attention just gathered.
+
+Analogy: attention is the meeting where everyone shares notes. Feed-forward is each person going back to their desk and processing what they heard. Then another meeting (attention), then another desk-time (feed-forward), and so on for 96 rounds.
+
+Interestingly, recent interpretability research suggests that most of the **factual knowledge** ("Paris is the capital of France") is stored in the feed-forward layers, while attention handles the *routing* of information between tokens. Knowledge in feed-forward, communication in attention.
+
+**Why "one forward pass per token" — and what a full response actually is.**
+
+When you see ChatGPT stream out a response word by word, **each token is one complete forward pass through the entire transformer**. Generating a 500-token response means running the model 500 times.
+
+The process:
+
+1. You send a prompt. The model runs once. It outputs probabilities over the vocabulary. It picks a token (say, `"The"`).
+2. `"The"` is appended to the prompt. The model runs again on the new (slightly longer) input. It outputs probabilities. Picks `"answer"`.
+3. `"answer"` is appended. Model runs again. Picks `"is"`.
+4. ... and so on until the model picks a special end-of-sequence token, or hits a max length.
+
+This is why longer responses take longer — it's literally linear in the number of output tokens. And it's why streaming is so natural for LLMs: the tokens *are* produced one at a time, not all at once.
+
+A naive implementation would recompute everything from scratch each pass. In practice, the previously-computed attention keys and values are cached (the **KV cache**), so each new token only needs to compute itself, not re-process the whole context. This makes generation much faster but doesn't change the fundamental fact: one forward pass per output token.
+
+**Pre-2017 — "one word at a time" meant something different.**
+
+Before the transformer, the dominant architecture for language was **RNNs (Recurrent Neural Networks)** and their improved variants (LSTM, GRU). They processed text **strictly sequentially during training too**:
+
+- Read word 1 → update hidden state
+- Read word 2 → update hidden state (which now contains a compressed memory of word 1)
+- Read word 3 → update hidden state (memory of words 1+2)
+- ... and so on
+
+The "hidden state" was a fixed-size vector that had to compress everything seen so far. Two big problems:
+
+1. **No parallelism during training.** You couldn't process word 5 until you'd processed words 1–4. This made training painfully slow on long sequences. GPUs love parallelism, and RNNs couldn't use it.
+2. **Long-range dependencies were hard.** By the time you'd compressed 500 words into one fixed-size vector, the influence of word 1 on word 500 was nearly lost. The signal degraded.
+
+**2017 — "Attention Is All You Need" introduced the Transformer.** The key insight: drop recurrence entirely. Use attention to let every token look at every other token directly, in parallel. Suddenly:
+
+- **Training is parallel.** All tokens in a sequence are processed simultaneously during training. GPUs go brrr. Training that took weeks now takes days.
+- **Long-range dependencies are trivial.** Token 500 can attend to token 1 directly, with no signal degradation.
+
+Note the asymmetry: **training is parallel, inference is still sequential** (one token at a time, as described above). The parallelism win is during training, where you have the whole sequence already and can predict every position at once. This is what made it economically feasible to train on trillions of tokens, which is what enabled the LLM era. No transformers → no GPT → no modern LLMs. That 2017 paper is the foundational moment.
+
+---
+
+### How does the model pick the next token? Why isn't the output always the same?
+
+The final layer of a transformer produces a probability distribution over the *entire vocabulary* — at each step, the model gives a probability to every possible next token. The question is: how do you pick one?
+
+The obvious answer ("always pick the highest probability one") is called **greedy decoding**, and it's usually a bad idea. The output becomes repetitive, boring, and often degenerate — the model gets stuck in loops, repeating the same phrase. Introducing controlled randomness produces varied, more natural-sounding text.
+
+This is controlled by **sampling strategies**:
+
+**Temperature** — A knob that scales the probability distribution before sampling.
+
+- `temperature = 0` → always pick the highest probability token. Deterministic. Same input → same output every time. Used when you want consistency (e.g., extracting structured data).
+- `temperature = 1` → sample from the model's raw distribution. Natural balance.
+- `temperature = 2` → flatten the distribution (low-probability tokens get a bigger chance). More creative, more random, more likely to go off the rails.
+
+**Top-k sampling** — Only consider the top `k` most probable tokens, ignore the rest. Sample from those.
+
+**Top-p (nucleus) sampling** — Consider the smallest set of tokens whose cumulative probability ≥ `p` (e.g., 0.9). Adaptive — sometimes that's 3 tokens, sometimes 30, depending on how confident the model is.
+
+**Why even bother with randomness?**
+
+1. **Creativity** — for writing, brainstorming, dialogue, you want variation.
+2. **Avoiding loops** — greedy decoding often gets stuck repeating itself because the model's strong prediction reinforces its own previous output.
+3. **Exploration** — sometimes the highest-probability token is locally good but leads to a dead end. Picking the second-best occasionally lets the model find better overall completions.
+
+**Practical defaults:**
+
+- Code generation, structured extraction → `temperature = 0` (you want predictability)
+- Chat, creative writing → `temperature = 0.7–1.0` (natural variation)
+- Brainstorming, idea generation → `temperature = 1.0–1.3` (more diverse outputs)
+
+This is why ChatGPT gives you slightly different answers each time even for the same question — it's sampling, not greedy decoding.
+
+---
+
 ### Then what are "reasoning models"? How is that different from normal models?
 
 If all models just predict the next token, what's special about models marketed as "reasoning" or "thinking" models (OpenAI's o1/o3/o4, DeepSeek-R1, etc.) vs standard chat models (GPT-4o, Claude Sonnet)?
@@ -331,6 +436,36 @@ Here's exactly how it works, step by step:
 
 That's it. Do this for trillions of sentences and the model gradually gets very good at predicting what comes next in any context. Along the way, to get good at this prediction game, it *has* to learn grammar, facts, logic, how code works, how arguments are structured — because all of those things determine what word comes next.
 
+**Under the hood — how the data is actually fed in (vocabulary, batches, masking):**
+
+A few mechanical details that the simple walkthrough above hides:
+
+*The vocabulary* — Before training even starts, you build a **vocabulary**: a fixed list of all the tokens the model knows about. A token is not always a word — it's a sub-word chunk produced by an algorithm called **Byte-Pair Encoding (BPE)** that scans a huge corpus and merges the most frequent character sequences until you have a vocabulary of fixed size (typically 32K–200K tokens). Examples from GPT-4's tokeniser: `"hello"` → 1 token, `"antidisestablishmentarianism"` → 6 tokens, `" the"` (with leading space) is a *different* token from `"the"` (no space), and non-English text often costs more tokens per word. The model's final output layer produces one probability per vocabulary entry — so vocabulary size literally sets the width of the output. The vocabulary never changes after training.
+
+*The (Batch, Context) table — flatten first, then chop into rows.* The entire training corpus is first concatenated into one long token stream, with `<|endoftext|>` inserted at every document boundary by the tokeniser pipeline (nobody adds it by hand — it's automatically appended at the end of every document during preprocessing, and it's a reserved special token defined when the tokeniser is built). For example:
+
+```
+[The] [cat] [sat] [on] [mat] [<|endoftext|>] [Dogs] [love] [to] [run] [<|endoftext|>] [Sky] [is] [blue] ...
+```
+
+This flat stream is then chopped into fixed-length chunks (the "context length", e.g. 2048 tokens). Each chunk becomes one row of the training tensor:
+
+- **Rows = batch dimension.** Each row is an *independent* training example. The model never mixes information across rows — row 2 has zero visibility into row 1, even if they were adjacent in the flat stream. Batching is purely a GPU-efficiency trick.
+- **Columns = context/sequence dimension.** Position within one example.
+
+Because `<|endoftext|>` lands wherever a document happened to end, it can appear *anywhere* in a row — beginning, middle, or end. It's not constrained to any particular column.
+
+*Causal masking — the hard architectural rule.* When predicting the token at column `t`, the model is only allowed to see tokens at columns `0` through `t-1` in the same row. This rule is called **causal masking** (or autoregressive masking) and it's enforced mechanically by the architecture — you cannot look right because right = the future = what you're trying to predict. If you let the model peek at future tokens, you've leaked the answer.
+
+*The `<|endoftext|>` token — a soft, learned reset signal, not a hard wall.* Here's the nuance: causal masking lets the model see *all* tokens to its left in the row, including tokens from a *previous* document that happen to sit to the left of an `<|endoftext|>`. The architecture does not cut the leftward view at `<|endoftext|>`. Example: in the row above, when predicting `"love"`, the model technically sees `[The, cat, sat, on, mat, <|endoftext|>, Dogs]` — doc-1 tokens included. What the model *learns through training* is to heavily discount everything before `<|endoftext|>` because that prior context never helps predict the next token in a new document. So:
+
+- **Hard rule (architecture):** always look at everything to the left in this row.
+- **Soft behaviour (learned):** treat `<|endoftext|>` as a wall; attention weights for tokens before it drop close to zero.
+
+*"But doesn't chopping into rows split sentences in half?"* Yes — phrases like `"Dogs love to run"` may straddle a chunk boundary and end up split across two unrelated rows. This is accepted noise. The model isn't trying to memorise specific sentences; it's learning statistical patterns across trillions of tokens. Any common phrase appears thousands of times across the corpus and lands fully within a chunk in the vast majority of those occurrences. The few split copies are irrelevant at scale.
+
+*Training chunking ≠ inference.* The fixed-row chunking is purely a training-time data-preparation step to create uniform GPU batches. At **inference time** (when you're chatting with the model) there's no chunking — your prompt is one continuous context up to the model's context window. The model never "sees" rows or batches when serving you.
+
 **"But won't it just memorise the answers?"**
 
 Good question. Yes, if it only ever saw "The capital of France is Paris" once and you tested it on the exact same sentence — that would be memorising, like solving past exam papers. But here's why that's not what happens:
@@ -378,6 +513,13 @@ Imagine you trained someone purely by having them read the entire internet — e
 They don't *answer* you. They *continue* whatever you said as if writing the next paragraph. If you type "What is 2+2?" they might respond with "What is 3+3? What is 4+4?" — because on the internet, questions are often followed by more questions (think quiz pages, FAQ lists). They're not *trying* to be helpful. They're just continuing the pattern.
 
 This is the base model. It knows everything but doesn't know it should answer you. It's like a person who read every book in a library but was never taught how to have a conversation. It's a text-continuation engine — not a chat assistant. OpenAI doesn't ship this to users. It needs more training (stages 2 and 3) before it becomes the ChatGPT you actually talk to.
+
+**This is exactly the distinction you see in Azure AI Foundry (and Hugging Face).** When you browse models, you'll often see two flavours of the same model family:
+
+- `Llama-3-70B` — the **base model**. Pretraining only. It completes text, doesn't follow instructions, doesn't behave like a chat assistant.
+- `Llama-3-70B-Instruct` (or `-Chat`) — the same base model after **SFT + RLHF** (stages 2 and 3, below). It answers questions, follows instructions, behaves like ChatGPT.
+
+Not all providers ship the base model. OpenAI, for example, does not give you GPT-4 base — only the post-trained version. Meta (Llama), Mistral, and others do release base models publicly, because researchers want them for fine-tuning on their own data. For 99% of applications you want the `-Instruct` / `-Chat` variant; the base model is only useful if you're doing your own SFT/RLHF.
 
 **Stage 2 — Supervised Fine-Tuning (SFT)**
 
@@ -472,6 +614,30 @@ Repeat this cycle billions of times across the training data. The weights gradua
 
 **Analogy:** Imagine calibrating a machine with a million dials. The machine produces wrong output. Backpropagation tells you exactly which dials contributed most to the error and exactly which direction to turn each one to fix it. Do this millions of times and the machine becomes accurate.
 
+**But how does it actually know which dial is the culprit?**
+
+The honest answer is **calculus** — specifically, the chain rule from high-school calculus, applied automatically to every weight in the network.
+
+The model is a giant composite function: input → layer 1 → layer 2 → ... → layer 96 → output. Each layer multiplies by some weights and applies a simple function. The whole thing is one massive mathematical expression with billions of variables (the weights).
+
+When we get a loss number (say, the model predicted "London" but the answer was "Paris"), we want to know: **for each weight, if I nudged it up by a tiny amount, would the loss go up or down, and by how much?** That "how much loss changes when I change this one weight" is the **gradient** of the loss with respect to that weight. It's a derivative.
+
+The chain rule says: if `y = f(g(h(x)))`, then derivatives multiply backwards through the chain. A neural network is exactly this — a long chain of functions. So the derivative of the loss with respect to a weight in layer 1 = (derivative of loss w.r.t. layer 96 output) × (derivative of layer 96 w.r.t. layer 95) × ... × (derivative of layer 2 w.r.t. layer 1). A long product, multiplied backwards from output to input.
+
+The "backward pass" mechanically:
+
+1. **Forward pass.** Run input through network. Save every intermediate value (the output of every layer).
+2. **Compute loss.** Compare final output to correct answer. Get a single number.
+3. **Compute gradient at the output.** Easy — the derivative of the loss with respect to the output is a simple formula.
+4. **Propagate backward, layer by layer.** At each layer, you already have the gradient flowing in from the layer ahead. Multiply by the local derivative and pass the result back to the previous layer. The chain rule does the bookkeeping.
+5. **At each weight, you get a gradient.** It says: "if you increase this weight by ε, the loss will change by approximately (gradient × ε)."
+
+So when you ask "how does it know who is the culprit?" — it doesn't deduce blame in any human sense. The math just falls out. A weight that had a big effect on the wrong output gets a big gradient. A weight that had little effect gets a tiny gradient. It's not "this weight is to blame" — it's "the math says changing this weight by 1 unit would change the loss by 0.0003, while changing that one by 1 unit would change it by 0.07 — so the second one is more responsible, adjust it more."
+
+Then each weight is updated: `new_weight = old_weight - learning_rate × gradient`. The minus sign means "move opposite to the gradient" (the gradient points toward *increasing* loss, and we want to decrease it). The learning rate is a small number (e.g., 0.0001) so we take tiny steps and don't overshoot.
+
+**Modern frameworks (PyTorch, TensorFlow) do all this automatically** via a feature called **autograd**. You write the forward pass; the framework records every operation and automatically computes the backward pass. You never compute derivatives by hand. This is why deep learning became practical — you don't need to be a calculus wizard to train a model.
+
 **Are human brains like this?**
 
 Superficially similar, fundamentally different:
@@ -488,6 +654,88 @@ Superficially similar, fundamentally different:
 The brain inspired the *idea* of neural networks (layers of connected units that learn by adjusting connection strengths), but the specific mechanism of backpropagation has no known biological equivalent. Brains don't do calculus on error gradients. They use local learning rules (each synapse adjusts based on local activity) and are shaped by evolution, not optimisation algorithms.
 
 Use the analogy for intuition. Don't take it literally.
+
+---
+
+### A complete training example, end to end
+
+Let's trace one single training step in detail using everything covered above. Tiny example so the numbers are followable, but the principles scale exactly to GPT-4.
+
+**Setup:**
+
+- Vocabulary: 50,000 tokens
+- Model: small transformer, say 100M parameters, 12 blocks
+- Training text snippet: `"The capital of France is Paris"`
+- After tokenisation: `[The] [ capital] [ of] [ France] [ is] [ Paris]` — 6 tokens with IDs say `[464, 3139, 286, 4881, 318, 6342]`
+
+**Step 1 — Prepare input and target.**
+
+The model is trained to predict the next token at every position. From this one sentence, we create 5 prediction tasks at once:
+
+| Position | Input (sees) | Target (must predict) |
+|---|---|---|
+| 1 | `The` | ` capital` |
+| 2 | `The capital` | ` of` |
+| 3 | `The capital of` | ` France` |
+| 4 | `The capital of France` | ` is` |
+| 5 | `The capital of France is` | ` Paris` |
+
+All 5 predictions happen in **one forward pass** thanks to causal masking — each position only sees tokens to its left.
+
+**Step 2 — Forward pass.**
+
+1. Each token ID is converted to an **embedding** — a learned vector of size, say, 768. So now we have a 6×768 matrix.
+2. A **positional encoding** is added to each row of that matrix so the model knows token order (position 1, 2, 3...).
+3. The embeddings pass through **transformer block 1**: attention (tokens look left and gather info), then feed-forward (each token's vector refined).
+4. Output of block 1 → block 2 → block 3 → ... → block 12.
+5. After the final block, we have a 6×768 matrix.
+6. The final **output projection** layer multiplies this by a 768×50,000 matrix, producing a 6×50,000 matrix of **logits** (raw scores, one per vocabulary token).
+7. Apply **softmax** (a function that turns logits into probabilities summing to 1). Each row is now a probability distribution over the vocabulary.
+
+So at position 5, after seeing `"The capital of France is"`, the model outputs probabilities for all 50,000 possible next tokens. Maybe:
+
+- `Paris` → 0.42
+- `the` → 0.08
+- `Lyon` → 0.05
+- `London` → 0.03
+- ...everything else summing to 0.42
+
+**Step 3 — Compute loss.**
+
+For each of the 5 positions, compare the predicted distribution to the actual answer. The loss function is **cross-entropy loss**. Intuitively: high when the model assigned low probability to the correct token, low when it assigned high probability.
+
+Shape of the formula: `loss = -log(probability assigned to correct token)`.
+
+At position 5, the model gave `Paris` probability 0.42 → loss = `-log(0.42) ≈ 0.87`.
+
+If it had given `Paris` probability 0.99, loss would be `-log(0.99) ≈ 0.01` — almost zero. If it had given 0.001, loss would be `-log(0.001) ≈ 6.9` — large.
+
+Average the loss across all 5 positions → one number, e.g., `1.34`. Total loss for this example.
+
+**Step 4 — Backward pass.**
+
+The framework (PyTorch, etc.) traces backwards through every operation that contributed to the loss. For each of the 100 million weights, it computes a gradient via the chain rule (as described in the backprop section above):
+
+- A weight in the attention of block 7 that affected how `France` influenced position 5: gradient = 0.003
+- A weight in the embedding for the token `Paris`: gradient = -0.012
+- A weight in some unrelated part of the network: gradient = 0.0000001
+
+Autograd does this automatically. No human writes derivative formulas.
+
+**Step 5 — Update weights.**
+
+For each weight: `new_weight = old_weight - learning_rate × gradient`. With learning rate = 0.0001:
+
+- Weight with gradient 0.003 → new value = old - 0.0000003 (tiny nudge down)
+- Weight with gradient -0.012 → new value = old + 0.0000012 (tiny nudge up)
+
+Each weight moves a hair's breadth. Individually meaningless.
+
+**Step 6 — Repeat.** Next training example. Do it all again. And again.
+
+**Scale:** each training batch processes thousands of examples in parallel on GPUs. A full training run processes trillions of tokens. For a frontier model, this takes months on tens of thousands of GPUs. After all that — billions of tiny weight adjustments later — the weights have settled into values that minimise the loss across the entire training corpus. That accumulated competence is what we experience as "the model knows things."
+
+**Key insight:** every interaction you have with ChatGPT is the *inference-time* version of step 2 above (the forward pass). The model isn't learning from your conversation — it's just running its already-trained weights forward to produce probabilities, sampling from them (per the temperature/top-p section), and outputting tokens. All the learning happened during training; inference is frozen.
 
 ---
 
@@ -614,3 +862,25 @@ The model can take a math problem written in French, solve it, explain the reaso
 | **Temperature** | Controls randomness in generation. Lower = more deterministic/conservative. Higher = more creative/risky |
 | **Diffusion model** | Architecture for image/video generation. Learns to remove noise from random static, guided by text prompts |
 | **Modality** | A type of data — text, image, audio, video. Multimodal models handle multiple modalities |
+| **Base model** vs **Instruct/Chat model** | Base = pretraining only, completes text. Instruct/Chat = base + SFT + RLHF, behaves like an assistant. Foundry lists both |
+| **Vocabulary** | The fixed list of all tokens a model can read or produce. Set during tokenisation, never changes |
+| **Tokeniser / BPE** | Byte-Pair Encoding. Algorithm that builds the vocabulary by merging frequent character sequences into tokens |
+| **Causal masking** | Rule that a token can only attend to tokens at earlier positions. Prevents the model from cheating by seeing future tokens during training |
+| **Attention** | Transformer layer where tokens look at each other and gather relevant information. Uses query/key/value vectors |
+| **Feed-forward layer** | Transformer layer applied to each token independently. Refines the info attention gathered. Stores most factual knowledge |
+| **Transformer block** | One unit of (attention + feed-forward). Stacked many times (e.g., 96 in GPT-3) to form the full model |
+| **RNN / LSTM** | Pre-2017 architecture. Processed text sequentially, one token at a time. Replaced by transformers due to parallelism and long-range issues |
+| **Forward pass** | One run of input through the model to produce output. Inference = one forward pass per generated token |
+| **KV cache** | Optimisation that caches attention keys/values from earlier tokens so each new token doesn't recompute the full context |
+| **Softmax** | Function that converts a vector of raw scores into a probability distribution (positive, sums to 1) |
+| **Logits** | The raw, pre-softmax scores the model's output layer produces — one per vocabulary token. Softmax turns them into probabilities |
+| **Positional encoding** | Vectors added to token embeddings so the transformer knows token order. Without it, the model would treat input as a bag of words |
+| **Multi-head attention** | Multiple attention operations run in parallel inside one layer, each learning different types of relationships (syntax, coreference, etc.) |
+| **Cross-entropy loss** | The loss function used in language model training. High when the model assigned low probability to the correct token |
+| **Gradient** | A number saying how much the loss would change if you nudged a particular weight. Computed by backprop |
+| **Learning rate** | The size of the step taken when updating weights. Small (e.g., 0.0001) to avoid overshooting the minimum |
+| **Autograd** | Feature in frameworks like PyTorch that automatically computes gradients for any forward pass you define |
+| **Sampling** | The process of picking a token from the model's probability distribution. Controlled by temperature, top-k, top-p |
+| **Top-k / Top-p sampling** | Strategies that restrict sampling to the most probable tokens (top-k = fixed count, top-p = until cumulative probability ≥ p) |
+| **Greedy decoding** | Always pick the highest-probability token. Deterministic but often repetitive |
+| **`<\|endoftext\|>`** | Special token marking document boundaries during training. Lets multiple unrelated documents share one row |
