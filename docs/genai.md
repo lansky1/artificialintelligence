@@ -573,43 +573,68 @@ This is the **interpretability problem** — figuring out what a model's numbers
 
 ### How a transformer turns tokens into a prediction
 
-Let's trace exactly what happens when the model reads the prompt `The cat sat on the` and predicts the next word.
+Let's trace exactly what happens when the model reads `The cat sat on the` and predicts the next word. The *same* machinery runs during training and during chat — only what happens *after* the prediction differs (see step 8).
+
+**First, the biggest misconception to clear up: the vocabulary exists *before* training.**
+
+The vocabulary — the fixed list of (say) 50,000 tokens the model can read or produce — is built once, from the whole corpus, *before any training begins*. Every common word, `mat` included, is already on that list on day one. So the model *can* output `mat` from its very first step; it just gives it a tiny probability at first. Training never adds or removes words — it only changes the **probability** the model assigns to each word in a given context.
+
+- Before training: `The cat sat on the ___` → `mat` ≈ 0.00002 (random, like every other word).
+- After training: `The cat sat on the ___` → `mat` ≈ 0.65.
+
+The word was always available; training just learned *when* to make it likely. This single point resolves most "how can it predict a word it never saw?" confusion.
 
 **1. Tokens and IDs**
 
-A **token** is a chunk of text (often a sub-word piece). The tokenizer splits your text into tokens and gives each one an integer **ID** — a lookup number from a fixed vocabulary. The ID carries no meaning; it just identifies which entry you have. (This vocabulary lookup is separate from the **KV cache**, which stores attention results during generation — more on that later.)
+A **token** is a chunk of text (often a sub-word piece). The tokenizer splits your text into tokens and gives each one an integer **ID** — a row number in that fixed vocabulary:
 
-**2. Token vectors and model weights**
+```text
+"The cat sat on the"  →  [The][ cat][ sat][ on][ the]  →  IDs [464, 3797, 3332, 319, 262]
+```
 
-Each ID picks one row from a learned **embedding matrix** (a big table of numbers). That row is the token's starting **vector** — its list of numbers. Every token vector has the same length, the model's **hidden size** — for example, 4,096 numbers.
+An ID carries no meaning. It is an *address* — "row 262 of the vocabulary" — like a seat number, not the person sitting in the seat.
 
-These embedding numbers begin mostly random and are shaped during training. They are only a small slice of the model's weights. Most of the billions of weights live in the attention, feed-forward, and output matrices that every token shares.
+**2. Token vectors — and yes, these ARE the model's weights**
+
+There is one giant lookup table, the **embedding matrix**, with **one row per vocabulary word**. Each row is a list of numbers — that word's starting **vector**. Every row has the same length, the model's **hidden size** (e.g. 4,096 numbers). "Assigning a vector" to a token is just a lookup: ID 262 → grab row 262. Nothing clever.
+
+```text
+Embedding matrix (toy hidden size = 4)
+  row 262 (the)  → [ 0.1, -0.3,  0.7,  0.2 ]
+  row 319 (on)   → [-0.5,  0.4,  0.1,  0.0 ]
+  row 3332 (sat) → [ 0.2,  0.2, -0.6,  0.9 ]
+```
+
+The facts that usually confuse people:
+
+- **The embedding matrix *is* part of the parameters (the "weights").** Those rows are learned numbers, exactly like the attention and feed-forward weights. Toy: 50,000 words × 4 = 200,000 numbers. Real: 50,000 × 4,096 ≈ **205 million** — and that is *only* the embedding table. The attention, feed-forward, and output matrices add the rest, which is how you reach billions of parameters.
+- **Random at start, better with training.** Every row begins as noise. Backprop nudges the rows until words used alike sit near each other (`cat` near `dog`, far from `Tuesday`). A half-trained model has half-useful embeddings; a finished one has good ones.
+- **The vector size never varies.** Every token, in every input, gets a vector of the *same* fixed length (the hidden size). Only the numbers inside differ — never the length.
+- **Same word → same *starting* row**, but attention (step 4) reshapes it by context, so the *final* vector for `the` in one sentence differs from `the` in another.
 
 **3. Positional information**
 
-Attention by itself does not know token order. Without help, `dog bites man` and `man bites dog` would look like the same bag of tokens. So the model also supplies **position information**.
-
-Older transformers add a position vector to each token vector. Many modern LLMs use **RoPE**, which instead rotates the attention query and key vectors based on position. Either way, the model learns where each token sits and how far apart tokens are.
+Attention by itself is order-blind — without help, `dog bites man` and `man bites dog` look like the same bag of tokens. So the model adds **position information** to each vector. Older transformers add a position vector; many modern LLMs use **RoPE**, which rotates the attention query/key vectors by position. Either way, each vector now also knows *where* it sits and how far it is from the others.
 
 **4. Transformer blocks: attention + feed-forward**
 
-This is the heart of the model. A **transformer block** does two things, and the model stacks many of them.
+This is the heart of the model. A **transformer block** does two things, and the model stacks many of them (e.g. 32 or 96).
 
-First, **attention** — how each token gathers useful information from earlier tokens. The intuition is a simple matching game. Every token produces three things:
+First, **attention** — each token gathers information from earlier tokens, via a matching game. Each token produces three things from its vector:
 
 - a **query** = "what am I looking for?"
 - a **key** = "what do I offer?"
-- a **value** = "the actual information to copy."
+- a **value** = "the actual information to hand over."
 
-A token compares its query against every earlier token's key. Where a query and key match well, that token pulls in more of the matching token's value. So the word `sat` can reach back and pull in information from `cat`, because `sat` is looking for a subject and `cat` offers one. A **causal mask** blocks a token from looking at future tokens — it can only see what came before.
+A token compares its query against every earlier token's key; where they match well, it copies in more of that token's value. So `sat` (a verb hunting for a subject) matches `cat`'s key (a noun/subject) and pulls in "my subject is cat." This is also **where contextual meaning is built**: `bank` next to `river` ends up with a different vector than `bank` next to `money`, even though both started from the same embedding row. A **causal mask** blocks a token from looking *right* (at future tokens) — right is the very thing we are predicting, so peeking would be cheating.
 
-Second, **feed-forward** — the same small neural network runs over each token vector on its own, refining whatever attention just gathered.
+Second, **feed-forward** — the same small network runs over each token's vector on its own, refining whatever attention just gathered.
 
-In short: attention *shares* information between tokens; feed-forward *processes* that information. Stack these two steps many times and the vectors grow steadily more context-aware.
+In short: attention *shares* information between tokens; feed-forward *digests* it. Stack the pair many times and the vectors grow steadily more context-aware.
 
-**5. The number of vectors never changes inside the model**
+**5. The number of vectors never changes — and why the *last* one makes the prediction**
 
-Five input tokens produce five vectors. Every block still outputs five vectors of the same size — only the numbers inside them change.
+Five input tokens produce five vectors. Every block still outputs five vectors of the same size; only the numbers inside change.
 
 ```text
 The | cat | sat | on | the       <- 5 initial vectors
@@ -617,32 +642,55 @@ The | cat | sat | on | the       <- 5 initial vectors
 The | cat | sat | on | the       <- 5 contextual vectors
 ```
 
-There is normally no vector for the blank in `The cat sat on the ___`. The final vector belongs to the last real token, `the` — but it now carries information gathered from the whole sentence before it.
+There is **no vector for the blank** in `The cat sat on the ___`. So which vector predicts the next word? The rule the model is trained on: **each position's vector is responsible for predicting the token that comes *after* it.** `The`'s position predicts `cat`; `cat`'s predicts `sat`; … and the **last token's** position (`the`) predicts whatever fills the blank. That is why we read off the top-of-stack vector of the *last real token* — by now it has absorbed the whole sentence, and predicting what's next is precisely its job.
 
-**6. From the last vector to a word**
+**6. From the last vector to the next word**
 
-An output matrix turns that last vector into one raw score, a **logit**, for every token in the vocabulary. **Softmax** then converts those raw scores into probabilities:
+1. Multiply that last vector by the **output matrix** → one raw score (a **logit**) for *every* word in the vocabulary (all 50,000).
+2. Run **softmax** → squash those scores into probabilities that sum to 1.
 
 ```text
-mat    65%
-floor  12%
-chair   5%
-...
+mat    0.65
+floor  0.12
+chair  0.05
+...    (all 50,000, summing to 1.0)
 ```
 
-The model picks a token, appends it to the input, and runs again to predict the next one. The token count grows between generation steps, never while passing through the blocks. A **KV cache** stores the keys and values of earlier tokens so they don't have to be recomputed each step.
+- **The output is always from the vocabulary** — one entry from that 50,000-word list, never anything outside it. (Longer "new" words are built by stringing sub-word tokens together, but each piece is from the vocab.)
+- **The whole distribution is computed** (a probability for every word), but **one** token is chosen.
+- **The chosen word does *not* get a vector during this pass.** The output is just probabilities. `mat` only gets its embedding *later*, when it is appended and fed back in (step 7).
+- **Greedy vs. variability:** you can always take the highest (`mat`) — *greedy decoding* — or roll a weighted die so the output varies. That choice is the whole subject of the next section.
 
-**7. What training changes**
+**7. The generation loop, run by run (KV cache, and why the model has no memory)**
 
-During training, the model predicts the next token at every position in real text. It compares its probabilities to the actual next tokens, measures the error, and **backpropagation** makes tiny updates to the embeddings and to the shared attention, feed-forward, and output weights.
+Generation is a loop — one token per step:
 
-Early on, the probabilities are close to random. After many updates, a context like `The cat sat on the` gives high probability to tokens like `mat`. A single training run covers many batches and usually billions or trillions of token predictions — not one sentence.
+- **Run 1:** feed `The cat sat on the` → last vector → probabilities → pick `mat` → append → `The cat sat on the mat`.
+- **Run 2:** the input is now `The cat sat on the mat`. *Here* `mat` finally gets its embedding and flows through the model. Read off the new last vector → predict the next token → append. Repeat until a "stop" token.
+
+Two common questions:
+
+- **KV cache.** In run 2, the keys and values for `The cat sat on the` were already computed in run 1. Recomputing them is wasteful, so they are saved in the **KV cache** and reused; only the new token's key/value is computed. Pure speed-up — the maths result is identical.
+- **The model is stateless between separate requests.** The KV cache lives only *within one ongoing generation*. A brand-new request starts fresh with nothing remembered. A chatbot only "remembers" earlier messages because the app **resends the whole conversation as text** each time. The model's only memory is the text currently in front of it.
+
+**8. Training run vs. inference run**
+
+Same forward pass; the difference is what happens around it.
+
+| | Training run | Inference run (you chatting) |
+|---|---|---|
+| Predicts at | *Every* position at once (parallel) | Effectively just the next token |
+| Knows the answer? | **Yes** — the real next word is right there in the text | No — it is generating it |
+| Afterwards | Measure error, **backpropagate, update all weights** (embeddings included) | **Nothing updated** — weights are frozen; just sample and loop |
+
+So in training on `The cat sat on the mat`, the model makes all five predictions at once (`The`→`cat`, `The cat`→`sat`, … `The cat sat on the`→`mat`). For the last one, the true answer `mat` is sitting in the text *for free* — no human labels it. If the model gave `mat` only 0.02, that gap is the error; backprop nudges the weights so next time `mat` is more likely *in this context*. Repeat across billions of such pairs and the model becomes good at prediction. (A full numbered example with real loss numbers is in **A complete training example, end to end**, below.)
 
 **Why attention replaced RNNs and LSTMs**
 
-Earlier sequential models (**RNNs** and **LSTMs**) read tokens one at a time and carried a single summary of the past forward. They didn't only see the last word, but distant information had to survive inside that constantly rewritten summary, and it could fade.
+Earlier sequential models (**RNNs** and **LSTMs**) read tokens one at a time and carried a single running summary of the past. They did not only see the previous word, but distant information had to survive inside that constantly rewritten summary, and it could fade. Two transformer wins fixed this:
 
-Transformers let each token connect directly to whatever earlier tokens matter, and they process all training positions in parallel. Generation is still sequential, because each new output token depends on the tokens already produced.
+- **Direct access** — every token reaches *any* earlier token at full strength, not through a fading summary.
+- **Parallel training** — all positions are processed together instead of one-by-one, which is the real reason large models became trainable. (Generation is still sequential, because each new token depends on the ones already produced.)
 
 ---
 
