@@ -373,7 +373,7 @@ Evaluation is covered in depth in the next section (Section 6).
 
 ---
 
-## 6. Evaluation (Measuring Whether It Actually Works)
+## 6. Evaluation
 
 ### Why Evaluating LLMs Is Hard
 
@@ -414,6 +414,15 @@ Offline tells you whether quality held up against your known test cases. Online 
 
 There is no single best scoring method. Each fits a different kind of output, so most real systems combine several.
 
+Before choosing a metric, define the **task** and the **cost of each failure**. Do not default to whichever number is easiest to put on a dashboard. The metric becomes the behaviour the team optimises, so it must reward what the product actually needs.
+
+For example, suppose 97% of transactions are legitimate. A useless fraud detector that predicts "legitimate" every time still gets 97% accuracy while catching no fraud at all. This is **class imbalance**: one label is so common that overall accuracy hides failure on the rare, important label. In that case:
+
+- prioritise **recall** when missing a real positive is most costly (for example, fraud or disease),
+- prioritise **precision** when false alarms are most costly (for example, blocking a legitimate payment),
+- use **F1** when both matter and you need one comparison score,
+- report the separate precision and recall values too, because the same F1 score can hide different trade-offs.
+
 **1. Rule-based / exact-match checks**
 
 Compare the output to a known answer with code: string equality, a regex, "is this valid JSON?", "does it contain this value?".
@@ -423,19 +432,27 @@ Compare the output to a known answer with code: string equality, a regex, "is th
 
 For classification (sorting inputs into labels), four standard metrics summarise quality. Plainly:
 
-- **Accuracy** — what fraction of all predictions were correct.
+- **Accuracy** — what fraction of all predictions were correct. Most informative when classes are reasonably balanced and mistakes have similar costs.
 - **Precision** — of the items you *flagged* as positive, how many really were.
 - **Recall** — of the items that really *are* positive, how many you caught.
 - **F1** — a single score balancing precision and recall (their harmonic mean, which stays low unless *both* are high — so you can't game it by maxing out just one).
 
-**2. Reference-overlap metrics (BLEU, ROUGE)**
+**2. Reference-based metrics (BLEU, ROUGE, METEOR)**
 
 These score how much the output's words and phrases overlap with a reference answer. Roughly: **BLEU** asks how much of the *output* appears in the reference (precision-leaning, from machine translation); **ROUGE** asks how much of the *reference* appears in the output (recall-leaning, from summarisation).
 
-- *Useful* as a cheap, automatic signal when you have reference texts.
-- *Weakness:* they reward surface overlap, not meaning. A correct paraphrase that uses different words scores low, even though it is right.
+**METEOR** was designed for translation and is more forgiving than BLEU. It aligns individual words using exact matches, word stems, and synonyms, then penalises matches that appear in a fragmented or incorrect order. This means a valid translation using words such as "blocked" instead of "suspended" can receive credit even when its exact phrases differ from the reference.
 
-**3. LLM-as-a-judge**
+- *Useful* as a cheap, automatic signal when you have reference texts.
+- *Weakness:* even METEOR only approximates meaning. These metrics remain dependent on the chosen reference and can miss valid paraphrases or factual errors.
+
+**3. Perplexity**
+
+**Perplexity** measures how well a language model predicts a held-out text sequence. Lower perplexity means the model assigned higher probability to the actual next tokens, so it is less "surprised" by the text. It is useful when comparing language models or checkpoints on the **same dataset with the same tokenisation**.
+
+Perplexity can expose poor language modelling and incoherent text, but it does **not** measure whether an answer is correct, grounded, safe, or useful. A fluent hallucination can have low perplexity. Scores from models with different tokenisers are also not directly comparable, and many hosted APIs do not expose the token probabilities needed to calculate it.
+
+**4. LLM-as-a-judge**
 
 Use a second capable LLM to grade the output against a written rubric — for example, *"Is this answer faithful to the source? Score 1-5."*
 
@@ -447,16 +464,25 @@ The pitfalls are real, so treat the judge's scores as estimates, not truth:
 - It needs a **clear rubric**. Vague instructions give noisy, inconsistent scores.
 - It must be **spot-checked by humans**. Periodically grade a sample yourself and confirm the judge agrees.
 
-**4. Human evaluation**
+**5. Human evaluation**
 
 People read the outputs and rate them. This is the **gold standard** for quality — but it is slow and costly, so you cannot run it on every change. Its most valuable job is to *validate the automated judges*: if humans and the LLM judge agree on a sample, you can trust the judge to scale.
 
 | Method | Best for | Main weakness |
 |---|---|---|
 | Rule-based / exact-match | Structured output, classification | Useless for free text |
-| Reference-overlap (BLEU, ROUGE) | Cheap auto-score vs a reference | Penalises correct paraphrases |
+| BLEU / ROUGE | Cheap auto-score vs a reference | Rewards surface overlap rather than meaning |
+| METEOR | Translation where stems and synonyms should count | Still reference-dependent; only approximates semantics |
+| Perplexity | Comparing language models on the same text and tokenisation | Measures predictability, not correctness or task success |
 | LLM-as-a-judge | Free text at scale | Biased; needs a rubric and spot-checks |
 | Human evaluation | The final word on quality | Slow and expensive |
+
+### Task-Specific Evaluation: Question Answering
+
+First decide what kind of question-answering system you built, because the scoring method changes:
+
+- **Extractive QA** returns a span copied from a source document. Use **exact match** when every word matters, plus **token-level F1** to give partial credit when most of the reference span was recovered. Exact match is deliberately strict; token-level F1 shows whether a zero was actually a near miss.
+- **Generative QA** composes a new answer, often from several sources. Exact string matching is too brittle, so grade semantic correctness and answer relevance with a rubric, an LLM judge, or human review. If retrieval is involved, also evaluate the RAG-specific dimensions below.
 
 ### Task-Specific Evaluation: RAG
 
@@ -510,8 +536,13 @@ You do not build this from scratch. The observability platforms from Section 5 �
 
 | What you are building | What to evaluate / which method |
 |---|---|
-| Classifier or extractor (structured output) | Exact-match + accuracy, precision, recall, F1 |
-| Summariser or translator | LLM-as-a-judge on a rubric; ROUGE/BLEU as a cheap signal |
+| Balanced classifier | Accuracy, plus per-class precision and recall |
+| Imbalanced classifier (fraud, rare events) | Precision, recall, and F1; do not rely on accuracy alone |
+| Structured data extractor | Schema/rule checks + exact match |
+| Extractive question-answering | Exact match + token-level F1 |
+| Summariser | LLM-as-a-judge on a rubric; ROUGE as a cheap coverage signal |
+| Translator | Human/LLM rubric; BLEU and METEOR as automatic signals |
+| Language-model checkpoint | Perplexity on a fixed held-out dataset with consistent tokenisation |
 | RAG question-answering | Context relevance, faithfulness, answer relevance (RAGAS) |
 | Tool-using agent | Trajectory: tool choice, order, wasted steps |
 | Anything in production | Quality + cost, latency, error rates + thumbs/edits/regenerations |
@@ -1228,6 +1259,8 @@ Parameters alone are not enough. A model also needs sufficient high-quality data
 | **Faithfulness / Groundedness** | Whether an answer is actually supported by the retrieved documents, not invented |
 | **Golden dataset (eval set)** | A curated set of inputs with known good answers, used as the benchmark to test a pipeline against |
 | **BLEU / ROUGE** | Automatic text-overlap scores comparing generated text to a reference (BLEU favours precision, ROUGE favours recall) |
+| **METEOR** | A reference-based translation metric that gives credit for stems and synonyms and penalises fragmented word order |
+| **Perplexity** | How surprised a language model is by held-out text; lower means better next-token prediction, not necessarily more correct answers |
 | **Precision / Recall / F1** | Precision = how much of what you returned was correct; recall = how much of the correct stuff you returned; F1 = their balance |
 | **RAGAS** | A library that scores RAG pipelines on metrics like faithfulness, answer relevance, and context quality |
 | **Regression testing (for prompts)** | Re-running a fixed eval set after a prompt change to check nothing that worked before now breaks |
