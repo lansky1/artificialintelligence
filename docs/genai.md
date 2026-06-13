@@ -41,6 +41,54 @@ LangChain chains follow a DAG (Directed Acyclic Graph) structure. A DAG is a gra
 
 This makes LangChain ideal for linear pipelines but insufficient for complex agentic workflows that require iteration, decision-making, and memory.
 
+
+### Is a Diamond Pattern Valid in a DAG?
+
+Yes. The "acyclic" constraint only prohibits loops — branching out and merging back is perfectly valid because data still only flows forward.
+
+```
+        ┌──── branch A ────┐
+input ──┤                  ├──── output parser ──── final output
+        └──── branch B ────┘
+```
+
+In LCEL, there are two ways to express this:
+
+**`RunnableParallel`** — both branches run simultaneously, outputs merge as a dict:
+
+```python
+from langchain_core.runnables import RunnableParallel
+
+parallel = RunnableParallel(
+    path_a=chain_a,
+    path_b=chain_b
+)
+# output is {"path_a": ..., "path_b": ...}
+diamond_chain = parallel | merge_and_parse
+```
+
+**`RunnableBranch`** — mutually exclusive routing, only one branch runs based on a condition:
+
+```python
+from langchain_core.runnables import RunnableBranch
+
+branch = RunnableBranch(
+    (lambda x: x["type"] == "A", chain_a),
+    chain_b  # default
+)
+diamond_chain = branch | output_parser
+```
+
+The key distinction: `RunnableParallel` runs all branches and merges results; `RunnableBranch` routes to exactly one branch. Both are valid DAGs. What breaks the DAG model is a loop where a node's output feeds back into a prior node — which is exactly what LangGraph adds.
+
+### Can't I Just Use RunnableBranch for Tool Fallbacks?
+
+Yes — for a **fixed, known number of fallbacks**. `tool_a → evaluate → RunnableBranch(sufficient → output_parser, insufficient → tool_b → output_parser)` is a valid DAG.
+
+It breaks down when the number of iterations isn't known upfront. If `tool_b` is also insufficient, you'd need to nest another branch inside, and another inside that. A DAG must be **fully defined before execution starts** — every node and edge must exist before `.invoke()` is called. You can't encode "keep trying until it works" in a static graph.
+
+LangGraph solves this because the routing decision (loop again vs. exit) is made at *runtime* by a conditional edge function inspecting the current state — the graph doesn't need to know how many iterations it will take.
+
 ---
 
 ## 2. LangGraph
