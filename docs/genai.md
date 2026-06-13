@@ -582,7 +582,7 @@ The vocabulary — the fixed list of (say) 50,000 tokens the model can read or p
 - Before training: `The cat sat on the ___` → `mat` ≈ 0.00002 (random, like every other word).
 - After training: `The cat sat on the ___` → `mat` ≈ 0.65.
 
-The word was always available; training just learned *when* to make it likely. This single point resolves most "how can it predict a word it never saw?" confusion.
+The word was always available; training just learned *when* to make it likely.
 
 **1. Tokens and IDs**
 
@@ -594,7 +594,7 @@ A **token** is a chunk of text (often a sub-word piece). The tokenizer splits yo
 
 An ID carries no meaning. It is an *address* — "row 262 of the vocabulary" — like a seat number, not the person sitting in the seat.
 
-**2. Token vectors — and yes, these ARE the model's weights**
+**2. Token vectors**
 
 There is one giant lookup table, the **embedding matrix**, with **one row per vocabulary word**. Each row is a list of numbers — that word's starting **vector**. Every row has the same length, the model's **hidden size** (e.g. 4,096 numbers). "Assigning a vector" to a token is just a lookup: ID 262 → grab row 262. Nothing clever.
 
@@ -641,6 +641,8 @@ The | cat | sat | on | the       <- 5 initial vectors
              transformer blocks
 The | cat | sat | on | the       <- 5 contextual vectors
 ```
+
+**These contextual vectors are temporary — they are never copied back into the embedding matrix.** During training, the prediction error is propagated backward through them, and the optimizer uses the resulting gradients to adjust the embedding rows (along with the model's other weights). During inference, there is no backward pass, so the embedding matrix does not change.
 
 There is **no vector for the blank** in `The cat sat on the ___`. So which vector predicts the next word? The rule the model is trained on: **each position's vector is responsible for predicting the token that comes *after* it.** `The`'s position predicts `cat`; `cat`'s predicts `sat`; … and the **last token's** position (`the`) predicts whatever fills the blank. That is why we read off the top-of-stack vector of the *last real token* — by now it has absorbed the whole sentence, and predicting what's next is precisely its job.
 
@@ -802,8 +804,6 @@ Step by step:
 Do this for trillions of sentences and the model gets very good at predicting what comes next. To win at that game it *has* to learn grammar, facts, logic, and how code works — because all of those decide which word comes next.
 
 **Under the hood: vocabulary, batches, and masking**
-
-The simple walkthrough hides a few mechanical details.
 
 **Vocabulary.** Before training starts, you build a **vocabulary**: a fixed list of all the tokens the model knows. A token is not always a whole word — it is a sub-word chunk produced by **Byte-Pair Encoding (BPE)**, an algorithm that scans a large corpus and merges the most frequent character sequences until the vocabulary hits a fixed size (typically 32K–200K tokens). Examples from GPT-4's tokeniser:
 
@@ -1100,8 +1100,6 @@ Each weight moves a hair's breadth. On its own, meaningless.
 **Scale.** Each batch processes thousands of examples in parallel on GPUs, and a full run processes trillions of tokens. For a frontier model this takes months on tens of thousands of GPUs. After all those billions of tiny weight nudges, the weights settle into values that minimise the loss across the whole training corpus. That accumulated competence is what we experience as "the model knows things."
 
 **Key insight.** Every chat you have with ChatGPT is just the *inference-time* version of step 2 — the forward pass. The model isn't learning from your conversation; it's running its already-trained weights forward to produce probabilities, sampling from them (see the temperature/top-p section), and outputting tokens. All the learning happened during training. Inference is frozen.
-
----
 
 ---
 
