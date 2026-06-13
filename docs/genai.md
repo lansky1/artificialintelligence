@@ -107,9 +107,17 @@ None of these patterns fit cleanly into a DAG. LangGraph is a framework (built o
 - *Fixed edges* — unconditional connections (after node A, always go to node B)
 - *Conditional edges* — a routing function examines the current state and decides which node to transition to next
 
-**State** is a typed object (typically a TypedDict or Pydantic model — both are ways of defining a Python dictionary/object where each field has a declared type, so you get autocomplete and error checking) that is shared across all nodes in the graph. Every node receives the full state as input and returns updates to it. This is the critical difference from LangChain chains — there is a single, persistent, structured object that accumulates information as the graph executes. Nodes communicate through state, not just through direct input-output piping.
+**State** is a typed object (typically a TypedDict or Pydantic model — both are ways of defining a Python dictionary/object where each field has a declared type, so you get autocomplete and error checking) available to all nodes in the graph. A node reads a state snapshot and returns only its updates; LangGraph applies those updates using per-field reducers. This is not a freely mutable global dictionary, but runtime-managed state that accumulates as the graph executes.
 
 **Cycles** are what make LangGraph a graph rather than a DAG. A node can route back to a previous node, creating a loop. This is essential for agent behaviour: reason → act → observe → reason again. The loop continues until a termination condition is met (e.g., the agent decides it has a final answer).
+
+### Why Didn't LangChain Use Global State?
+
+It could: applications already used memory, agent scratchpads, or dictionaries passed through chains. LCEL deliberately favoured explicit `input → output` transformations because each invocation remains isolated and its data dependencies stay visible.
+
+A freely mutable global object would create problems when batching, running asynchronously, or executing parallel branches: multiple tasks could overwrite each other's values, observe half-completed updates, or require locks that remove parallelism. It would also make streaming harder because state mutation does not define chunk ordering, completion, backpressure, or which invocation owns an update.
+
+LangGraph formalises the useful version of shared state. Parallel nodes read the same snapshot and return partial updates, which the runtime merges at a controlled boundary using declared reducers. Therefore, common state itself was not the anti-pattern; hidden, uncontrolled shared mutation was.
 
 ### Why Not Just Use a Python Loop Around a Chain?
 
@@ -213,7 +221,73 @@ The RAG pipeline has two phases:
 
 ### Why Chunking Matters
 
-If you embed an entire 50-page document as one vector, the embedding represents a vague average of the whole document. When a user asks a specific question, this coarse embedding may not match well. Splitting into smaller chunks (e.g., 500–1000 tokens) ensures that each embedding represents a focused piece of information, improving retrieval accuracy.
+If you embed an entire 50-page document as one vector, it must represent many unrelated topics at once. The meaning of one useful sentence gets weakened by all the other content. This is called **semantic dilution**: the vector becomes a vague average of the document and may not closely match a specific question. Smaller chunks keep each embedding focused and improve retrieval precision.
+
+**Who creates the chunks?** The developer chooses a strategy and configuration; a text-splitting library performs the split. Common strategies are fixed-size, sentence/paragraph-aware, semantic, and structure-aware splitting. The correct size is determined by testing retrieval with representative questions, not by a universal rule.
+
+**Small versus large chunks:**
+
+| Small chunks | Large chunks |
+|---|---|
+| Match focused questions precisely | Preserve more surrounding context |
+| Add less irrelevant text to the prompt | Keep related sentences, headings, and definitions together |
+| May separate a statement from its heading, subject, or definition | Cause semantic dilution by mixing several topics into one vector |
+| May require several chunks to answer one question | Consume more of the LLM's context window |
+
+Overlap can preserve information at boundaries, but excessive overlap creates duplicates. A common starting point is 300–800 tokens with 10–20% overlap, followed by evaluation.
+
+**Parent-child retrieval** lets the system search small pieces but give the LLM a larger section. For example, an `Annual Leave Policy` parent section may contain these child chunks:
+
+```text
+Child 1: Employees receive 20 vacation days.
+Child 2: Contractors do not receive paid vacation.
+Child 3: Unused vacation expires at year-end.
+```
+
+For `What happens to unused vacation?`, vector search precisely finds Child 3. Its stored `parent_id` is then used to fetch the complete `Annual Leave Policy`, which gives the LLM the surrounding context:
+
+```text
+search small child → find exact match → return larger parent
+```
+
+### Handling Large Documents
+
+Treat a large document as a hierarchy instead of splitting it blindly every fixed number of tokens:
+
+```text
+document → headings/sections → paragraphs or child chunks
+```
+
+First extract structural elements such as headings, paragraphs, tables, and page numbers. Use sections as parent chunks, split oversized sections into smaller searchable children, and store metadata such as `document_id`, `parent_id`, heading, and page with each child. Search the children and fetch their parent when more context is needed.
+
+Large document collections use the same chunking approach, but additionally require batch ingestion, deduplication, and metadata filters such as department, document type, tenant, or year to reduce the search space.
+
+### How an Embedding Model Creates a Vector
+
+```text
+text → tokens → token IDs → token vectors → transformer → pooling → text vector
+```
+
+1. **Tokenisation:** The tokenizer splits text into vocabulary entries. For example, it might split `Employees receive vacation` into `Employ`, `ees`, ` receive`, and ` vacation`.
+2. **Token IDs:** Each vocabulary entry has an arbitrary integer identifier, such as `[8321, 291, 4256, 10982]` (illustrative values). These numbers are lookup keys, not meanings or embeddings: `8321` simply identifies one row in the tokenizer's vocabulary.
+3. **Token vectors:** Each ID selects a learned row from the model's embedding matrix. With a 50,000-token vocabulary and 768-dimensional internal vectors, this matrix has shape `50,000 × 768`.
+4. **Contextualisation:** Transformer layers use self-attention to update each token vector using the surrounding tokens. This lets words such as `bank` represent different meanings in financial and river contexts.
+5. **Pooling and normalisation:** Pooling combines all contextual token vectors into one vector for the complete chunk. With **mean pooling**, each vector position is averaged independently:
+
+```text
+Employees → [0.2, 0.4, 0.6]
+receive   → [0.4, 0.1, 0.3]
+vacation  → [0.6, 0.4, 0.0]
+
+mean      → [(0.2+0.4+0.6)/3, (0.4+0.1+0.4)/3, (0.6+0.3+0.0)/3]
+          → [0.4, 0.3, 0.3]
+```
+
+Real token vectors may have hundreds or thousands of positions, but the same operation is applied to every position. Other models use a special token, such as `[CLS]`, whose vector gathers information from all tokens through attention, or use learned weights so important tokens contribute more. The model or embedding API normally performs pooling internally and returns only the final text vector. It may then normalise that vector for similarity comparison.
+
+Embedding models are commonly trained with related and unrelated text pairs. Training moves a query closer to its relevant passage and farther from irrelevant passages. Meaning is therefore distributed across the complete vector; an individual dimension usually has no simple human-readable interpretation.
+
+**What is stored?** A vector-store record commonly contains an `id`, embedding vector, original chunk, and metadata such as document, page, or section. Alternatively, the vector store may contain only `id + vector + metadata`, while the chunk is kept in a separate document or key-value store. In both cases the relationship is `vector ↔ chunk ID ↔ text`; similarity search finds the vector, but the corresponding text is sent to the LLM.
 
 ### Why RAG Over Fine-Tuning
 
@@ -314,74 +388,71 @@ This is called the **interpretability problem**. Researchers are working on it �
 
 ---
 
-### What's actually inside a transformer? (Attention, feed-forward, and why pre-2017 was different)
+### How a transformer turns tokens into a prediction
 
-Every modern LLM is built from a stack of identical **transformer blocks** (GPT-3 has 96 of them). Each block contains two types of layers: **attention** and **feed-forward**. They alternate, repeated dozens of times. That's the whole architecture.
+Consider the prompt `The cat sat on the`.
 
-Before the stack of blocks runs, two preparatory steps happen at the very bottom of the model:
+**1. Tokens and IDs**
 
-- **Token embeddings** — each token ID is looked up in a learned table and replaced with a vector (e.g., 768 numbers). This is the token's starting representation.
-- **Positional encoding** — because the transformer processes all tokens in parallel (no inherent notion of order), a position vector is *added* to each token embedding to inject "this token is at position 5." Without this, the model would treat the sequence as a bag of words and have no idea which token came first. Modern models use learned positional embeddings or schemes like RoPE (Rotary Position Embedding).
+The tokenizer splits the text into tokens and maps each token to an integer ID. The ID is only a lookup key in the fixed vocabulary; it does not contain meaning. This vocabulary mapping is separate from the **KV cache**, which stores attention calculations during generation.
 
-Then the embedded, position-aware tokens flow through the stack.
+**2. Token vectors and model weights**
 
-**Attention — the layer where tokens *look at each other*.**
+Each ID selects one row from a learned **embedding matrix**. That row is the token's starting vector. All token vectors have the same length, called the model's hidden size: for example, 4,096 numbers.
 
-For each token in the sequence, attention asks: "which other tokens (to my left) are relevant to me, and how much?" It then mixes information from those relevant tokens into the current token's representation.
+The embedding numbers start mostly random and are learned during training. They are only a small part of the model's weights. Most of the billions of weights are in the attention, feed-forward, and output matrices shared by every token.
 
-Concrete example. The sentence: `"The cat sat on the mat because it was tired."`
+**3. Positional information**
 
-When processing the token `"it"`, attention figures out that `"cat"` is the relevant antecedent (not `"mat"`). It pulls information from `"cat"` into the representation of `"it"`. That's how the model knows `"it"` refers to the cat.
+Attention alone does not know token order, so the model also supplies position information. Otherwise, `dog bites man` and `man bites dog` would look like the same collection of tokens.
 
-Mechanically: each token produces three vectors — a *query* (what am I looking for?), a *key* (what do I offer?), and a *value* (what information do I carry?). Every token's query is compared against every other token's key. High similarity = "this token is relevant to me." The relevant tokens' values are then weighted and summed into the current token.
+Older transformers add a position vector to each token vector. Many modern LLMs use **RoPE**, which rotates the attention query and key vectors according to position. Both approaches tell the model where tokens occur and how far apart they are.
 
-**Multi-head attention** means several attention operations run in parallel inside the same layer, each with its own Q/K/V weights. Each "head" tends to specialise — one might track syntactic structure, another coreference ("it" → "cat"), another long-range topical relevance. Their outputs are concatenated and combined. More heads = more types of relationships the model can track simultaneously.
+**4. Transformer blocks**
 
-Attention is what lets transformers handle long-range dependencies — a token at position 1000 can directly attend to a token at position 1, in a single step.
+Each block has two main operations:
 
-**Feed-forward — the layer where each token *thinks alone*.**
+- **Attention:** each token gathers useful information from earlier tokens. Queries mean "what am I looking for?", keys mean "what do I offer?", and values contain the information to copy. A causal mask prevents a token from seeing future tokens.
+- **Feed-forward:** the same neural network processes each token vector separately, refining the information attention gathered.
 
-After attention mixes information between tokens, the feed-forward layer processes each token independently. It's a simple 2-layer neural network applied to each token's vector. Its job is to transform/refine the information that attention just gathered.
+In simple terms: attention shares information between tokens; feed-forward processes that information. Repeating both operations creates increasingly context-aware vectors.
 
-Analogy: attention is the meeting where everyone shares notes. Feed-forward is each person going back to their desk and processing what they heard. Then another meeting (attention), then another desk-time (feed-forward), and so on for 96 rounds.
+**5. The number of vectors does not change inside the model**
 
-Interestingly, recent interpretability research suggests that most of the **factual knowledge** ("Paris is the capital of France") is stored in the feed-forward layers, while attention handles the *routing* of information between tokens. Knowledge in feed-forward, communication in attention.
+Five input tokens produce five vectors. Every transformer block still outputs five vectors of the same size; only the numbers inside them change.
 
-**Why "one forward pass per token" — and what a full response actually is.**
+```text
+The | cat | sat | on | the       <- 5 initial vectors
+             transformer blocks
+The | cat | sat | on | the       <- 5 contextual vectors
+```
 
-When you see ChatGPT stream out a response word by word, **each token is one complete forward pass through the entire transformer**. Generating a 500-token response means running the model 500 times.
+There is normally no vector for the blank in `The cat sat on the ___`. The final vector belongs to the last real token, `the`, but now also contains information gathered from the preceding context.
 
-The process:
+**6. From the last vector to a word**
 
-1. You send a prompt. The model runs once. It outputs probabilities over the vocabulary. It picks a token (say, `"The"`).
-2. `"The"` is appended to the prompt. The model runs again on the new (slightly longer) input. It outputs probabilities. Picks `"answer"`.
-3. `"answer"` is appended. Model runs again. Picks `"is"`.
-4. ... and so on until the model picks a special end-of-sequence token, or hits a max length.
+An output matrix converts the last vector into one raw score, or **logit**, for every token in the vocabulary. **Softmax** converts those scores into probabilities:
 
-This is why longer responses take longer — it's literally linear in the number of output tokens. And it's why streaming is so natural for LLMs: the tokens *are* produced one at a time, not all at once.
+```text
+mat    65%
+floor  12%
+chair   5%
+...
+```
 
-A naive implementation would recompute everything from scratch each pass. In practice, the previously-computed attention keys and values are cached (the **KV cache**), so each new token only needs to compute itself, not re-process the whole context. This makes generation much faster but doesn't change the fundamental fact: one forward pass per output token.
+The model selects a token, appends it to the input, and repeats the process to generate the following token. The token count increases between generation steps, not while passing through the transformer blocks. A **KV cache** avoids recalculating keys and values for earlier tokens.
 
-**Pre-2017 — "one word at a time" meant something different.**
+**7. What training changes**
 
-Before the transformer, the dominant architecture for language was **RNNs (Recurrent Neural Networks)** and their improved variants (LSTM, GRU). They processed text **strictly sequentially during training too**:
+During training, the model predicts the next token at every position in known text. Its probabilities are compared with the actual next tokens, producing an error. Backpropagation then makes small updates to the embeddings and the shared attention, feed-forward, and output weights.
 
-- Read word 1 → update hidden state
-- Read word 2 → update hidden state (which now contains a compressed memory of word 1)
-- Read word 3 → update hidden state (memory of words 1+2)
-- ... and so on
+Early in training the probabilities are close to random. After many updates, contexts such as `The cat sat on the` give higher probability to tokens such as `mat`. One training run contains many batches and usually billions or trillions of token predictions, not just one sentence.
 
-The "hidden state" was a fixed-size vector that had to compress everything seen so far. Two big problems:
+**Why attention replaced older sequential models**
 
-1. **No parallelism during training.** You couldn't process word 5 until you'd processed words 1–4. This made training painfully slow on long sequences. GPUs love parallelism, and RNNs couldn't use it.
-2. **Long-range dependencies were hard.** By the time you'd compressed 500 words into one fixed-size vector, the influence of word 1 on word 500 was nearly lost. The signal degraded.
+RNNs and LSTMs read tokens one at a time and carried a hidden-state summary forward. They did not see only the last word, but distant information had to survive inside that repeatedly updated summary and could fade.
 
-**2017 — "Attention Is All You Need" introduced the Transformer.** The key insight: drop recurrence entirely. Use attention to let every token look at every other token directly, in parallel. Suddenly:
-
-- **Training is parallel.** All tokens in a sequence are processed simultaneously during training. GPUs go brrr. Training that took weeks now takes days.
-- **Long-range dependencies are trivial.** Token 500 can attend to token 1 directly, with no signal degradation.
-
-Note the asymmetry: **training is parallel, inference is still sequential** (one token at a time, as described above). The parallelism win is during training, where you have the whole sequence already and can predict every position at once. This is what made it economically feasible to train on trillions of tokens, which is what enabled the LLM era. No transformers → no GPT → no modern LLMs. That 2017 paper is the foundational moment.
+Transformers let each token connect more directly to relevant earlier tokens and process all training positions in parallel. Generation remains sequential because each new output token depends on the tokens already generated.
 
 ---
 
@@ -599,6 +670,12 @@ It's the same file of numbers being refined three times, with three different de
 
 After all three stages, you have one file of numbers. That's ChatGPT (or Claude, or Gemini). There is nothing else running behind the scenes — no secret database, no rule engine, no internet connection. Just numbers being multiplied together really fast.
 
+**Can an instruct model be fine-tuned again after RLHF?**
+
+Yes. RLHF does not lock or finish the model; it only produces another checkpoint whose weights can be updated again. Enterprises usually start with an instruct model and apply SFT, often through LoRA/QLoRA adapters, using examples of their desired tasks, terminology, formats, or tool calls. Preference methods such as DPO or RL can also be applied again when preference data is available.
+
+Further training can weaken general instruction-following or safety behaviour, so it normally uses a low learning rate, high-quality data, and regression evaluations. Not every instruct model uses traditional RLHF; some use SFT followed by preference optimisation such as DPO.
+
 ---
 
 ### If it's all just numbers, is more parameters the only way to make models better?
@@ -733,7 +810,7 @@ All 5 predictions happen in **one forward pass** thanks to causal masking — ea
 **Step 2 — Forward pass.**
 
 1. Each token ID is converted to an **embedding** — a learned vector of size, say, 768. So now we have a 6×768 matrix.
-2. A **positional encoding** is added to each row of that matrix so the model knows token order (position 1, 2, 3...).
+2. **Positional information** is added or applied (for example, with RoPE) so the model knows token order.
 3. The embeddings pass through **transformer block 1**: attention (tokens look left and gather info), then feed-forward (each token's vector refined).
 4. Output of block 1 → block 2 → block 3 → ... → block 12.
 5. After the final block, we have a 6×768 matrix.
@@ -812,63 +889,36 @@ Five root causes:
 
 ---
 
-### Follow-up: "But math, code, and medical text were in the training data — how is emergence surprising?"
+### Why Is This Called Emergence?
 
-You're partially right. Math problems, code, and medical textbooks were all in the training data. The model "saw" them. In that sense — not surprising.
+Pattern learning itself was expected. To predict text, a model benefits from learning grammar, concepts, cause and effect, proof structures, and common reasoning patterns. It does not store every written deduction separately; it learns compressed, distributed regularities that can sometimes be recombined for new problems.
 
-The actual surprise is three specific things that go beyond "it saw examples":
+In LLM research, a capability is called **emergent** when it was not explicitly programmed or directly targeted, appears much more successfully in larger models than smaller ones, and was difficult to predict by extrapolating smaller-model results. It does not mean that the capability appeared magically or without a cause.
 
-**1. Small models trained on the same data can't do it.**
+Researchers expected better next-token prediction as models grew. What was less certain was that the same objective would produce broad abilities such as learning tasks from prompt examples, following new instructions, writing programs, and combining skills across domains without separate training for every task.
 
-Take a model with 1 billion parameters. Train it on the exact same internet data. It cannot solve novel math problems, reason about hypotheticals, or pass medical exams. Scale that same architecture to 100+ billion parameters with the same data. Suddenly it can.
+The term is debated. Some apparently sudden abilities result from binary evaluation: an almost-correct answer scores `0`, while a completely correct answer scores `1`. When partial progress is measured continuously, some capabilities improve smoothly rather than appearing at one sharp threshold.
 
-This discontinuous jump — not gradual improvement, but capabilities appearing abruptly at certain scale thresholds (called "phase transitions") — is what nobody predicted. If it were just "it memorised examples," small models should show proportionally smaller ability. They show essentially *zero* ability until a threshold is crossed. Then they work.
+For example, if a solution requires five correct steps, gradual per-step improvement can look like a sudden capability jump:
 
-**But why does this happen? Why the sudden jump?**
+```text
+60% reliability per step → 0.6⁵ ≈ 8% complete solutions
+90% reliability per step → 0.9⁵ ≈ 59% complete solutions
+```
 
-Honest answer: we don't fully know. But the best current explanation is about **representation depth** — what the model can internally represent at different sizes.
+Therefore, a careful interpretation is: scaling gradually improves internal representations and their reliability, while complete-task benchmarks can make the resulting capability look abrupt.
 
-Think of it like this. To solve a math problem, you don't just need to know numbers. You need to simultaneously hold several concepts: what operation is being asked, what the rules of that operation are, how to apply them in sequence, how to track intermediate results. Each of these is a *pattern*. Small models can learn individual patterns (grammar, simple facts) because those are shallow — they don't require combining many things at once. But complex reasoning requires *layering patterns on top of patterns* — using one learned concept as input to another.
+### Why Does Scaling Help?
 
-A small model is like a person with a tiny desk. They can hold one piece of paper at a time. They can learn individual facts. But a multi-step math problem requires holding 5 pieces of paper simultaneously and combining them. No matter how many times you train them, the desk is too small. It's not a knowledge problem — it's a *capacity* problem.
+Scaling means balancing **model parameters, training data, and training compute**, not merely adding parameters.
 
-When the model gets big enough, it has enough parameters to build these layered internal representations: "concept A feeds into concept B which combines with concept C to produce reasoning step D." Below a certain size, these multi-layer representations literally can't fit — the model doesn't have enough numbers to encode them. Above that size, suddenly they can form, and the capability appears all at once.
+1. **More representational capacity:** More parameters let the model represent more features and finer distinctions. A smaller model must reuse limited capacity for many patterns, causing them to interfere with one another.
+2. **Better composition:** Complex tasks require combining several learned operations, such as understanding a question, selecting a rule, tracking variables, and producing an answer. More layers, dimensions, and attention capacity can make these combinations more reliable.
+3. **Better coverage of rare patterns:** More data provides additional examples of uncommon facts, code, proofs, and specialised language. More parameters help retain these patterns without sacrificing common ones.
+4. **Better predictive representations:** Correctly continuing text often requires modelling entities, context, time, and cause and effect. Lower prediction loss therefore encourages increasingly useful internal representations of language and the world described by it.
+5. **Higher end-to-end reliability:** Small improvements at each step multiply across a multi-step task, producing a much larger improvement in complete solutions.
 
-It's like ice freezing. You cool water gradually: 10°C, 5°C, 2°C, 1°C — still liquid. Then at 0°C, it suddenly becomes ice. The temperature was dropping smoothly, but the *state change* is abrupt. There's a threshold below which the structure can't form, and above which it suddenly can. Same principle with model capabilities.
-
-**"But can't a small model reason in the token stream like a reasoning model does?"**
-
-Good question — since reasoning models offload computation into generated tokens (as described above), shouldn't a small model be able to do the same? Write out step 1, then use that as context for step 2, effectively giving itself an external scratchpad?
-
-It helps, but it doesn't fully close the gap. Here's why:
-
-**Each individual step still requires a forward pass through the model.** Chain-of-thought lets you decompose a 5-step problem into 5 separate easier predictions. But each of those predictions still has to happen in *one* forward pass through the network. If a single step requires combining 3 concepts simultaneously — understanding what operation to apply, recognising the relevant pattern, and executing correctly — the model still needs enough internal capacity to do *that* in one shot.
-
-The desk analogy extends: chain-of-thought is like giving the person a notepad. They can write down intermediate results and refer back to them. That genuinely helps — now they don't need to hold everything in their head at once. But each time they look at their notepad and think about the next step, they still only have their tiny desk to work on. If a single step requires combining 3 pieces of paper simultaneously, the desk is still too small for that one step.
-
-**Concretely, what goes wrong with small models doing chain-of-thought:**
-
-1. **Error compounding** — Each step has a higher error rate because the model's per-step reasoning is weaker. Over a 5-step chain, even a 90% per-step accuracy gives you only 59% end-to-end accuracy. A large model at 99% per-step gives 95%. The chain amplifies the weakness.
-
-2. **Inability to self-correct** — Reasoning models don't just write steps linearly. They evaluate their own reasoning, catch mistakes, backtrack. This *meta-reasoning* (reasoning about your own reasoning) is itself a complex capability that requires the same layered internal representations small models lack. A small model following chain-of-thought often can't tell when it's gone wrong.
-
-3. **Poor step decomposition** — Knowing *how* to break a hard problem into manageable sub-steps is itself a sophisticated skill. Small models often decompose poorly — choosing steps that are still too complex for them individually, or breaking things up in ways that lose critical information between steps.
-
-4. **Training signal quality** — Reasoning models are specifically trained with RL on reasoning traces that lead to correct answers. You can train a small model the same way, and it does improve — but its ceiling is fundamentally lower. The RL can't teach the model to execute steps that exceed its per-step capacity.
-
-**So does chain-of-thought help small models?** Yes — measurably. A 7B model with chain-of-thought outperforms the same 7B model without it. But a 7B model with chain-of-thought still significantly underperforms a 70B model with chain-of-thought. The token stream is a workaround for the capacity problem, not a solution. It extends what you can do with a small desk by adding a notepad — but it can't make the desk itself bigger.
-
-**2. It generalises to problems it has never seen, not just recalls ones it has.**
-
-There's a fundamental difference between memorising that `∫x² dx = x³/3 + C` and being able to solve a novel integral the model has never encountered in training. A pure lookup system would fail on new problems. LLMs don't — they apply the underlying mathematical structure to solve genuinely new problems. That's generalisation, which is closer to understanding than memorisation.
-
-The baby analogy illustrates this: a child doesn't just repeat sentences it heard. It generates grammatically correct sentences it has *never* heard before by applying internalised rules.
-
-**3. Capabilities compose in ways that weren't explicitly trained.**
-
-The model can take a math problem written in French, solve it, explain the reasoning in English, then write Python code to verify it — in one response. No training example contained that exact combination as a complete task. The model assembles skills from different domains into novel configurations. This compositional generalisation — using learned capabilities together in new ways — is what surprised researchers most.
-
-**The honest synthesis:** You're right that calling it "surprising" can be overstated — if you compress all of human reasoning into a model, some reasoning ability emerging isn't conceptually shocking. The genuine surprise was the *degree* of it, the *discontinuity* with scale (it's not gradual), and the fact that a single training objective — predict the next token — was sufficient to produce all of it without task-specific training. Most researchers expected you'd need specialised training for each capability.
+More parameters alone are not sufficient: a model also needs enough high-quality data and compute to train them. Architecture, training objectives, post-training, and inference-time computation also affect capability. Scaling improves performance empirically, but researchers still do not have a complete mechanistic explanation for every ability it produces.
 
 ---
 
@@ -905,7 +955,7 @@ The model can take a math problem written in French, solve it, explain the reaso
 | **Gradient descent** | The optimisation step: nudge each weight in the direction that reduces error, proportional to its contribution |
 | **Loss** | A number measuring how wrong the model's prediction was. Training minimises this |
 | **Weights/Parameters** | The billions of numbers inside a neural network that define its behaviour. Adjusted during training |
-| **Emergence** | Capabilities appearing at scale that weren't explicitly trained — e.g., reasoning, arithmetic from next-token prediction |
+| **Emergence** | A capability not explicitly targeted that becomes substantially more successful at scale and was difficult to predict from smaller models; some apparent emergence depends on how performance is measured |
 | **Hallucination** | When a model generates plausible-sounding but factually incorrect or fabricated content |
 | **Temperature** | Controls randomness in generation. Lower = more deterministic/conservative. Higher = more creative/risky |
 | **Diffusion model** | Architecture for image/video generation. Learns to remove noise from random static, guided by text prompts |
@@ -922,7 +972,7 @@ The model can take a math problem written in French, solve it, explain the reaso
 | **KV cache** | Optimisation that caches attention keys/values from earlier tokens so each new token doesn't recompute the full context |
 | **Softmax** | Function that converts a vector of raw scores into a probability distribution (positive, sums to 1) |
 | **Logits** | The raw, pre-softmax scores the model's output layer produces — one per vocabulary token. Softmax turns them into probabilities |
-| **Positional encoding** | Vectors added to token embeddings so the transformer knows token order. Without it, the model would treat input as a bag of words |
+| **Positional encoding** | Information added or applied to token vectors so attention knows token order and distance. RoPE applies it by rotating query/key vectors |
 | **Multi-head attention** | Multiple attention operations run in parallel inside one layer, each learning different types of relationships (syntax, coreference, etc.) |
 | **Cross-entropy loss** | The loss function used in language model training. High when the model assigned low probability to the correct token |
 | **Gradient** | A number saying how much the loss would change if you nudged a particular weight. Computed by backprop |
