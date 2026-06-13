@@ -1196,11 +1196,70 @@ Parameters alone are not enough. A model also needs sufficient high-quality data
 
 ---
 
-## 8. Glossary
+## 8. Creating Small Language Models (SLMs) from LLMs
+
+An **SLM (Small Language Model)** uses fewer parameters and less compute than a general-purpose LLM. It is often specialised for a specific task and offers lower cost, latency, and memory usage.
+
+Two common techniques are:
+
+- **Knowledge distillation:** trains a smaller student model using a larger teacher LLM.
+- **Quantization:** stores an existing model's weights using fewer bits.
+
+### Knowledge Distillation
+
+A teacher LLM generates answers, labels, tool calls, or token probabilities. A smaller pretrained student model is fine-tuned to reproduce them.
+
+1. Collect representative prompts for the target task.
+2. Generate answers using the teacher LLM.
+3. Filter incorrect, unsafe, and low-quality examples.
+4. Fine-tune the student model.
+5. Evaluate it on a separate held-out dataset.
+
+| Method | Training signal |
+|---|---|
+| **Response distillation** | Teacher-generated text or structured outputs. Works with API-only models. |
+| **Logit distillation** | Teacher token probabilities. Richer signal, but requires access to logits. |
+
+Teacher outputs are synthetic data and may contain hallucinations or biases. Verify them before training, especially for reasoning and tool-use examples.
+
+### Quantization
+
+Quantization converts weights from formats such as FP32 or FP16 to INT8 or INT4. It reduces memory usage and may improve inference speed when supported by the hardware and runtime.
+
+| Weight format | Approximate weight memory |
+|---|---:|
+| FP32 (32-bit) | 28 GB |
+| FP16/BF16 (16-bit) | 14 GB |
+| INT8 (8-bit) | 7 GB |
+| INT4 (4-bit) | 3.5 GB |
+
+These estimates cover weights only. Runtime memory also includes the KV cache and temporary activations. Quantization reduces storage precision, not parameter count.
+
+| Approach | Description |
+|---|---|
+| **PTQ** | Quantizes an already trained model. Fast, but may reduce quality. |
+| **QAT** | Simulates quantization during training. Better quality retention, but requires more training. |
+
+### Combining Distillation and Quantization
+
+```text
+Teacher LLM → distil into student SLM → quantize SLM → deploy
+```
+
+Evaluate task accuracy, safety, latency, throughput, and memory after both distillation and quantization. Use a held-out dataset that was not used for training or quantization calibration.
+
+---
+
+## 9. Glossary
 
 | Term | Definition |
 |---|---|
 | **LLM** | Large Language Model. A neural network trained on huge amounts of text that can generate, summarise, translate, and reason over language |
+| **SLM** | Small Language Model. A lower-compute language model, often specialised for a narrower task or deployment environment |
+| **Knowledge distillation** | Training a smaller student model to reproduce useful behaviour or token probabilities from a larger teacher model |
+| **Quantization** | Representing model weights or computations with fewer bits to reduce memory use and potentially improve inference speed |
+| **PTQ** | Post-Training Quantization. Converting an already trained model to lower precision, usually with little or no additional training |
+| **QAT** | Quantization-Aware Training. Training while simulating low-precision arithmetic so the final quantized model retains more quality |
 | **LCEL** | LangChain Expression Language. The pipe (`\|`) syntax for composing chains declaratively |
 | **DAG** | Directed Acyclic Graph. A graph whose edges have direction and never loop back. LangChain's execution model |
 | **Node** | A single computation step in a LangGraph graph, written as a Python function |
